@@ -1,0 +1,5 @@
+/cpa-venv/
+__pycache__/
+*.py[cod]
+/.idea/
+/resources/
