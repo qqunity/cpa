@@ -1,4 +1,4 @@
-/cpa-venv/
+/cpa_venv/
 __pycache__/
 *.py[cod]
 /.idea/

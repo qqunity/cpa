@@ -18,6 +18,10 @@ from parser import ConsultantPlusParser
 from utils import get_config, generate_file_name_with_postfix
 from tqdm import tqdm
 from utils.exceptions import ConsultantPlusAnalyzerException
+from ipymarkup import show_dep_ascii_markup as show_markup
+from razdel import sentenize, tokenize
+from navec import Navec
+from slovnet import Syntax
 
 
 class ConsultantPlusAnalyzer:
@@ -31,19 +35,45 @@ class ConsultantPlusAnalyzer:
         self.stop_words = stopwords.words("russian")
         self.stop_words.extend(
             ['и', 'в', 'на', 'n', 'рф', 'гк', 'юридического', ' ', '1', 'ред',
-             '2', 'ст', 'также', 'свой', 'либо', 'это'])
+             '2', 'ст', 'также', 'свой', 'либо', 'это', 'текст', 'закон', 'который', 'иной', 'год', 'мочь', ])
         if is_elmo_used:
             self.model.load(self.config['model_info_file'])
+        self.navec = Navec.load(self.config['navec_news_v1_1B_250K_300d_100q'])
+        self.syntax = Syntax.load(self.config['slovnet_syntax_news_v1'])
+        self.syntax.navec(self.navec)
 
-    def text_analysis_by_codex_type(self, codex_type):
+    def save_information_about_target_words_by_codex_type(self, codex_type, codex_id):
         raw_articles_info = self.parser.sorted_articles_info[codex_type]
-        articles_tokens = list()
-        count = 0
-        for article_info in tqdm(raw_articles_info):
-            text = self.parser.get_article_text_by_id(article_info.id)
-            if text.find('если иное не предусмотрено') != -1:
-                count += 1
-        print(count / len(raw_articles_info))
+        if os.path.exists(generate_file_name_with_postfix(
+            self.config['information_about_target_words'],
+            str(codex_id))):
+            os.remove(generate_file_name_with_postfix(
+                self.config['information_about_target_words'],
+                str(codex_id)))
+        with open(generate_file_name_with_postfix(
+            self.config['information_about_target_words'],
+            str(codex_id)),
+            mode='w') as information_about_target_words_file:
+            information_about_target_words_writer = csv.writer(
+                information_about_target_words_file, delimiter=',',
+                quotechar='"',
+                quoting=csv.QUOTE_MINIMAL)
+            information_about_target_words_writer.writerow(
+                ['article_id', 'article_title', 'parts_after_target_words', 'sentences'])
+            for article_info in tqdm(raw_articles_info):
+                text = self.parser.get_article_text_by_id(article_info.id)
+                if text.find('если иное не предусмотрено') != -1:
+                    text_parts = text.split('если иное не предусмотрено')
+                    parts_before_target_words = list()
+                    for i in range(0, len(text_parts) - 1):
+                        parts_before_target_words.append(text_parts[i].split('.')[-1])
+                    parts_after_target_words = list()
+                    for i in range(1, len(text_parts)):
+                        parts_after_target_words.append(text_parts[i].split('.')[0])
+                    sentences = list()
+                    for i in range(len(parts_before_target_words)):
+                        sentences.append(parts_before_target_words[i] + 'если иное не предусмотрено' + parts_after_target_words[i])
+                    information_about_target_words_writer.writerow([article_info.id, article_info.title, '~'.join(parts_after_target_words), '~'.join(sentences)])
 
     def plot_word_vectors_graph(self, proximity_threshold, count_of_words=None):
         # TODO: найти порог близости для каждой статьи
@@ -97,10 +127,47 @@ class ConsultantPlusAnalyzer:
             nx.draw(G, pos, node_size=10000, with_labels=True)
             nx.draw_networkx_edge_labels(G, pos, edge_labels=edges_info)
             plt.show()
-            break
+
+    def save_syntax_analysis_by_text(self, text, file, is_many_sentences=False):
+        f = open(file, 'a')
+        sys.stdout = f
+        print('-' * 100)
+        if text != 'None':
+            if not is_many_sentences:
+                chunk = list()
+                for sent in sentenize(text):
+                    tokens = [_.text for _ in tokenize(sent.text)]
+                    chunk.append(tokens)
+                markup = next(self.syntax.map(chunk))
+                words, deps = list(), list()
+                for token in markup.tokens:
+                    words.append(token.text)
+                    source = int(token.head_id) - 1
+                    target = int(token.id) - 1
+                    if source > 0 and source != target:
+                        deps.append([source, target, token.rel])
+                show_markup(words, deps)
+            else:
+                for sentence in text.split('.'):
+                    if len(sentence.split()) > 5:
+                        chunk = list()
+                        for sent in sentenize(sentence):
+                            tokens = [_.text for _ in tokenize(sent.text)]
+                            chunk.append(tokens)
+                        markup = next(self.syntax.map(chunk))
+                        words, deps = list(), list()
+                        for token in markup.tokens:
+                            words.append(token.text)
+                            source = int(token.head_id) - 1
+                            target = int(token.id) - 1
+                            if source > 0 and source != target:
+                                deps.append([source, target, token.rel])
+                        show_markup(words, deps)
+        else:
+            print('None')
+        print('-' * 100)
 
     def get_words_matrix_variance(self):
-        # TODO: дисперсию именно векторов, а не векторов расстояния
         articles_vectors_info = dict()
         articles_words_info = dict()
         with open(self.config[
@@ -117,14 +184,9 @@ class ConsultantPlusAnalyzer:
                 articles_vectors_info[article_id].append(vector)
                 articles_words_info[article_id].append(word)
         for article_id, article_vectors in tqdm(articles_vectors_info.items()):
-            n = len(article_vectors)
-            dist_matrix = np.zeros((n, n))
-            for i in range(n):
-                for j in range(n):
-                    dist_matrix[i][j] = self.get_euclidean_distance(
-                        article_vectors[i], article_vectors[j])
+            mat = np.array(article_vectors)
             print(
-                f'The variance in article {article_id} is {dist_matrix.var()}')
+                f'The variance in article {article_id} is {mat.var()}')
 
     def get_prediction(self, words=None, file_with_vectors=None):
         words_vectors = list()
@@ -217,7 +279,7 @@ class ConsultantPlusAnalyzer:
 
     def save_most_popular_words_analysis(self, most_common_quantity):
         articles_tokens = list()
-        for (codex_type, _) in tqdm(analyzer.parser.codex_urls):
+        for (codex_type, _) in tqdm(self.parser.codex_urls):
             raw_articles_info = self.parser.sorted_articles_info[codex_type]
             for article_info in tqdm(raw_articles_info):
                 text = self.parser.get_article_text_by_id(article_info.id)
@@ -240,16 +302,16 @@ class ConsultantPlusAnalyzer:
                 quotechar='"',
                 quoting=csv.QUOTE_MINIMAL)
             most_popular_words_analysis_writer.writerow(
-                ['count_most_popular_words', 'frequency'])
+                ['word', 'word_count', 'frequency'])
             for info in f_dist.most_common(most_common_quantity):
                 most_popular_words_analysis_writer.writerow(
-                    [info[1], info[1] / len(articles_tokens)])
+                    [info[0], info[1], info[1] / len(articles_tokens)])
 
-    def save_unique_words_analysis(self, uniqueness_threshold,
-                                   is_frequency_analysis=False):
+    def save_unique_words_analysis(self, uniqueness_threshold):
+        """Сохраняем информацию о количестве уникальных слов и количестве статей, в которых эти слова встречаются, а также информацию о заданном количестве уникальных слов"""
         articles_tokens = list()
         articles_words_info = dict()
-        for (codex_type, _) in tqdm(analyzer.parser.codex_urls):
+        for (codex_type, _) in tqdm(self.parser.codex_urls):
             raw_articles_info = self.parser.sorted_articles_info[codex_type]
             for article_info in tqdm(raw_articles_info):
                 text = self.parser.get_article_text_by_id(article_info.id)
@@ -270,54 +332,50 @@ class ConsultantPlusAnalyzer:
         f_dist = list(filter(lambda item: item[1] <= uniqueness_threshold,
                              f_dist.items()))
         unique_words_info = dict()
+        # Сохраняем информацию в виде: 'уникальное слово': ['количество во всем корпусе', 'количество статей, в котром встретилось это слово']
         for word_info in f_dist:
             if word_info[0] not in unique_words_info:
                 unique_words_info[word_info[0]] = [word_info[1], 0]
-            for article_words in tqdm(articles_words_info):
-                if word_info[0] in article_words:
+            for article_id in tqdm(articles_words_info):
+                if word_info[0] in articles_words_info[article_id]:
                     unique_words_info[word_info[0]][1] += 1
-        print(unique_words_info)
+        if os.path.exists(self.config['articles_unique_words_info_file']):
+            os.remove(self.config['articles_unique_words_info_file'])
+        with open(self.config['articles_unique_words_info_file'],
+                  mode='w') as articles_unique_words_info_file:
+            articles_unique_words_info_writer = csv.writer(
+                articles_unique_words_info_file, delimiter=',',
+                quotechar='"',
+                quoting=csv.QUOTE_MINIMAL)
+            articles_unique_words_info_writer.writerow(
+                ['word', 'word_count', 'articles_count'])
+            for info in unique_words_info.items():
+                articles_unique_words_info_writer.writerow(
+                    [info[0], info[1][0], info[1][1]])
         unique_words_metrics = dict()
+        # Сохраняем информацию в виде: 'заданное количество слова во всем корпусе': 'количество таких слов во всем корпусе'
         for value in unique_words_info.values():
             if value[0] not in unique_words_metrics:
                 unique_words_metrics[value[0]] = value[1]
             else:
                 unique_words_metrics[value[0]] += value[1]
-        # if not is_frequency_analysis:
-        #     if os.path.exists(
-        #         self.config['articles_unique_words_analysis_file']):
-        #         os.remove(self.config['articles_unique_words_analysis_file'])
-        #     with open(self.config['articles_unique_words_analysis_file'],
-        #               mode='w') as articles_unique_words_analysis_file:
-        #         articles_unique_words_analysis_writer = csv.writer(
-        #             articles_unique_words_analysis_file, delimiter=',',
-        #             quotechar='"',
-        #             quoting=csv.QUOTE_MINIMAL)
-        #         # TODO: переименовать колнки и уточнить что здесь есть
-        #         articles_unique_words_analysis_writer.writerow(
-        #             ['count_unique_words', 'count_of_articles'])
-        #         for info in unique_words_metrics.items():
-        #             articles_unique_words_analysis_writer.writerow(
-        #                 [info[0], info[1]])
-        # else:
-        #     if os.path.exists(self.config[
-        #                           'articles_unique_words_analysis_file_with_frequency']):
-        #         os.remove(self.config[
-        #                       'articles_unique_words_analysis_file_with_frequency'])
-        #     with open(self.config[
-        #                   'articles_unique_words_analysis_file_with_frequency'],
-        #               mode='w') as articles_unique_words_analysis_file:
-        #         articles_unique_words_analysis_writer = csv.writer(
-        #             articles_unique_words_analysis_file, delimiter=',',
-        #             quotechar='"',
-        #             quoting=csv.QUOTE_MINIMAL)
-        #         articles_unique_words_analysis_writer.writerow(
-        #             ['count_unique_words', 'count_of_articles'])
-        #         for info in unique_words_metrics.items():
-        #             articles_unique_words_analysis_writer.writerow(
-        #                 [info[0], info[1] / len(articles_tokens)])
+        if os.path.exists(self.config['articles_unique_words_analysis_file']):
+            os.remove(self.config['articles_unique_words_analysis_file'])
+        with open(self.config['articles_unique_words_analysis_file'], mode='w') as articles_unique_words_analysis_file:
+            articles_unique_words_analysis_writer = csv.writer(articles_unique_words_analysis_file, delimiter=',', quotechar='"', quoting=csv.QUOTE_MINIMAL)
+            articles_unique_words_analysis_writer.writerow(['count_unique_words_frequency', 'count_unique_words_in_corpus'])
+            for info in unique_words_metrics.items():
+                articles_unique_words_analysis_writer.writerow([info[0], info[1]])
+        if os.path.exists(self.config['articles_unique_words_analysis_file_with_frequency']):
+            os.remove(self.config['articles_unique_words_analysis_file_with_frequency'])
+        with open(self.config['articles_unique_words_analysis_file_with_frequency'], mode='w') as articles_unique_words_analysis_file:
+            articles_unique_words_analysis_writer = csv.writer(articles_unique_words_analysis_file, delimiter=',', quotechar='"', quoting=csv.QUOTE_MINIMAL)
+            articles_unique_words_analysis_writer.writerow(['count_unique_words_frequency', 'count_unique_words_in_corpus_frequency'])
+            for info in unique_words_metrics.items():
+                articles_unique_words_analysis_writer.writerow([info[0], info[1] / len(articles_tokens)])
 
     def save_codex_hist_info(self, codex_type, codex_id, constraint=None):
+        """Сохранение частотности слов во всем корпусе"""
         raw_articles_info = self.parser.sorted_articles_info[codex_type]
         articles_tokens = list()
         for article_info in tqdm(raw_articles_info):
@@ -434,8 +492,57 @@ class ConsultantPlusAnalyzer:
         f_dist = FreqDist(text)
         f_dist.plot(30, cumulative=False)
 
+    def links_on_target_words_analysis(self):
+        for codex_id in tqdm(range(len(self.parser.codex_urls))):
+            if os.path.exists(generate_file_name_with_postfix(
+                self.config['information_about_target_words_with_links'],
+                str(codex_id))):
+                os.remove(generate_file_name_with_postfix(
+                    self.config['information_about_target_words_with_links'],
+                    str(codex_id)))
+            with open(generate_file_name_with_postfix(
+                self.config['information_about_target_words_with_links'],
+                str(codex_id)),
+                mode='w') as information_about_target_words_file:
+                information_about_target_words_writer = csv.writer(
+                    information_about_target_words_file, delimiter=',',
+                    quotechar='"',
+                    quoting=csv.QUOTE_MINIMAL)
+                information_about_target_words_writer.writerow(
+                    ['article_id', 'article_title', 'article_url', 'links_on_target'])
+                target_words_info = pd.read_csv(generate_file_name_with_postfix(self.config['information_about_target_words'], str(codex_id)))
+                for row in tqdm(target_words_info.itertuples()):
+                    links_on_target = list()
+                    for part_of_target_words in row[3].split('~'):
+                        if self.parser.get_links_on_target_words_by_id_and_target_words(row[1], part_of_target_words):
+                            links_on_target.append(self.parser.get_links_on_target_words_by_id_and_target_words(row[1], part_of_target_words))
+                        else:
+                            links_on_target.append('None')
+                    information_about_target_words_writer.writerow([row[1], row[2], self.parser.get_article_url_by_id(row[1]), ' '.join(links_on_target)])
+
     @staticmethod
-    def plot_frequency_analysis_of_words(is_constraint=None):
+    def save_syntax_analysis(analyzer):
+        for codex_id in tqdm(range(len(analyzer.parser.codex_urls))):
+            target_words_info = pd.read_csv(generate_file_name_with_postfix(
+                analyzer.config['information_about_target_words'], str(codex_id)))
+            for row in tqdm(target_words_info.itertuples()):
+                for sentence in row[-1].split('~'):
+                    analyzer.save_syntax_analysis_by_text(sentence, generate_file_name_with_postfix(analyzer.config['article_target_words_realation_info'], str(row[1])))
+
+    @staticmethod
+    def save_syntax_analysis_in_links(analyzer):
+        for codex_id in tqdm(range(len(analyzer.parser.codex_urls))):
+            target_words_info = pd.read_csv(generate_file_name_with_postfix(analyzer.config['information_about_target_words_with_links'], str(codex_id)))
+            for row in tqdm(target_words_info.itertuples()):
+                for url in row[-1].split(' '):
+                    if url != 'None':
+                        analyzer.save_syntax_analysis_by_text(analyzer.parser.get_text_by_url(url), generate_file_name_with_postfix(analyzer.config['article_target_words_in_links_realation_info'], str(row[1])), is_many_sentences=True)
+                    else:
+                        analyzer.save_syntax_analysis_by_text('None', generate_file_name_with_postfix(analyzer.config['article_target_words_in_links_realation_info'], str(row[1])))
+
+    @staticmethod
+    def plot_frequency_analysis_of_words(analyzer, is_constraint=None):
+        """Построение частотности слов во всем корпусе"""
         if not is_constraint:
             for i in range(10):
                 data = pd.read_csv(generate_file_name_with_postfix(
@@ -459,8 +566,8 @@ class ConsultantPlusAnalyzer:
                 plt.show()
 
     @staticmethod
-    def plot_unique_words_in_articles_analysis():
-        # TODO: нормировать ось x + отсортировать вероятности и наложить на один график
+    def plot_unique_words_in_articles_analysis(analyzer):
+        """Графики частотности уникальных слов в каждом кодексе по article_id"""
         for i in range(10):
             data = pd.read_csv(generate_file_name_with_postfix(
                 analyzer.config['unique_words_in_articles_analysis_file'],
@@ -469,11 +576,31 @@ class ConsultantPlusAnalyzer:
             data = data.sort_values('unique_words_frequency')
             data.plot(x='article_id', y='unique_words_frequency',
                       kind='scatter')
-            # plt.xticks(rotation=60)
             plt.show()
 
     @staticmethod
-    def plot_unique_words_analysis(is_frequency_analysis=False):
+    def plot_unique_words_in_articles_analysis_on_one_graph(analyzer):
+        """График частотности уникальных слов в каждом кодексе на одном графике с отсортированной частотностью"""
+        data = pd.read_csv(generate_file_name_with_postfix(
+                analyzer.config['unique_words_in_articles_analysis_file'],
+                str(0)),
+                           delimiter=',')
+        for i in range(1, 10):
+            data = pd.concat([data, pd.read_csv(generate_file_name_with_postfix(
+                analyzer.config['unique_words_in_articles_analysis_file'],
+                str(i)),
+                delimiter=',')])
+        data['article_id'] = data.apply(lambda row: row['article_id'] / data['article_id'].max(), axis=1)
+        data = data.sort_values('unique_words_frequency')
+        data = data.reset_index()
+        data.drop('article_id', axis='columns', inplace=True)
+        data.drop('index', axis='columns', inplace=True)
+        data.plot()
+        plt.show()
+
+    @staticmethod
+    def plot_unique_words_analysis(analyzer, is_frequency_analysis=False):
+        """Построение графика анализа уникальных слов"""
         if not is_frequency_analysis:
             data = pd.read_csv(
                 analyzer.config['articles_unique_words_analysis_file'])
@@ -481,17 +608,19 @@ class ConsultantPlusAnalyzer:
             data = pd.read_csv(
                 analyzer.config[
                     'articles_unique_words_analysis_file_with_frequency'])
-        data.plot(x='count_unique_words', y='count_of_articles', kind='scatter')
+        data.plot(x='count_unique_words_frequency', y='count_unique_words_in_corpus', kind='scatter')
         plt.show()
-        plt.hist(data.count_unique_words, weights=data.count_of_articles)
+        plt.hist(data.count_unique_words_frequency, weights=data.count_unique_words_in_corpus)
         plt.show()
 
     @staticmethod
-    def plot_most_popular_words_analysis():
+    def plot_most_popular_words_analysis(analyzer):
+        """Построение графика частотности самых популярных во всем корпусе слов"""
         data = pd.read_csv(analyzer.config['most_popular_words_analysis_file'])
-        plt.hist(data.count_most_popular_words, weights=data.frequency)
+        plt.hist(data.word_count, weights=data.frequency)
         plt.show()
-        data.plot(x='count_most_popular_words', y='frequency')
+        data.plot(x='word', y='frequency', kind='scatter', figsize=(50, 7))
+        plt.xticks(rotation=60)
         plt.show()
 
     @staticmethod
@@ -518,11 +647,22 @@ class ConsultantPlusAnalyzer:
 
 if __name__ == '__main__':
     analyzer = ConsultantPlusAnalyzer(is_elmo_used=False)
-    analyzer.get_prediction(file_with_vectors='./resources/test_words.csv')
+    # analyzer.plot_frequency_analysis_of_words(analyzer)
+    # print(analyzer.parser.get_text_by_url('/document/cons_doc_LAW_368629/41b49109d1875673ebbf6cef045eff7f1afe2d19/#dst27'))
+    # analyzer.save_syntax_analysis_in_links(analyzer)
+    # analyzer.save_syntax_analysis_by_text('Товарищество собственников жилья создается без ограничения срока деятельности, если иное не предусмотрено уставом товарищества', 'resources/lol.txt')
+    # analyzer.links_on_target_words_analysis()
+    # print(analyzer.parser.get_sentence_with_target_words_by_id_and_target_words(1, 'настоящим Кодексом'))
+    # for i, (codex_type, _) in tqdm(enumerate(analyzer.parser.codex_urls)):
+    #     analyzer.save_information_about_target_words_by_codex_type(codex_type, i)
+    # analyzer.plot_unique_words_in_articles_analysis_on_one_graph(analyzer)
+    # analyzer.get_words_matrix_variance()
+    # analyzer.plot_most_popular_words_analysis()
+    # analyzer.get_prediction(file_with_vectors='./resources/test_words.csv')
     # analyzer.plot_most_popular_words_analysis()
     # analyzer.plot_unique_words_analysis(is_frequency_analysis=True)
     # analyzer.get_words_matrix_variance()
-    # analyzer.plot_word_vectors_graph(9, 5)
+    analyzer.plot_word_vectors_graph(9, 5)
     # for (codex_type, _) in tqdm(analyzer.parser.codex_urls):
     #     analyzer.save_word_vectors_analysis_info(codex_type, 25)
     #     break

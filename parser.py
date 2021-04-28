@@ -74,19 +74,20 @@ class ConsultantPlusParser:
 
     def parse(self):
         current_article_id = 0
+        articles_info = list()
         for codex_type, url in tqdm(self.codex_urls):
             codex_page = BeautifulSoup(self.__make_request('GET', 'https:' + url,
                                                            custom_location=True).text, 'html.parser')
             codex_page_content = codex_page.find('div', class_='contents').find('contents')
             for article in tqdm(codex_page_content.find_all('a')):
                 if article.get_text().startswith('Статья'):
-                    self.articles_info.append(Article(id=current_article_id, url=article.get('href'), title=article.get_text(), codex_type=codex_type))
+                    articles_info.append(Article(id=current_article_id, url=article.get('href'), title=article.get_text(), codex_type=codex_type))
                     current_article_id += 1
         if os.path.exists(self.articles_info_file):
             os.remove(self.articles_info_file)
         with open(self.articles_info_file, mode='w') as articles_info_file:
             articles_info_writer = csv.writer(articles_info_file, delimiter=',', quotechar='"', quoting=csv.QUOTE_MINIMAL)
-            for article in tqdm(self.articles_info):
+            for article in tqdm(articles_info):
                 articles_info_writer.writerow([article.id, article.url, article.title, article.codex_type])
 
     def get_article_text_by_id(self, article_id):
@@ -94,5 +95,22 @@ class ConsultantPlusParser:
         article_page = BeautifulSoup(self.__make_request('GET', self.base_url + article.url, custom_location=True).text, 'html.parser')
         text = ''
         for part_of_text in article_page.find('div', class_='text').find_all('span'):
+            text += part_of_text.get_text()
+        return text
+
+    def get_article_url_by_id(self, article_id):
+        return list(filter(lambda item: item.id == article_id, self.articles_info))[0].url
+
+    def get_links_on_target_words_by_id_and_target_words(self, article_id, target_words):
+        article = list(filter(lambda item: item.id == article_id, self.articles_info))[0]
+        article_page = BeautifulSoup(self.__make_request('GET', self.base_url + article.url, custom_location=True).text, 'html.parser')
+        for part_of_text in article_page.find('div', class_='text').find_all('span'):
+            if target_words in part_of_text.get_text() and 'если иное не предусмотрено' in str(part_of_text) and 'href' in str(part_of_text).split('если иное не предусмотрено')[1].split('.')[0]:
+                return str(part_of_text).split('если иное не предусмотрено')[1].split('.')[0].split('href="')[1].split('">')[0]
+
+    def get_text_by_url(self, url):
+        page = BeautifulSoup(self.__make_request('GET', self.base_url + url, custom_location=True).text, 'html.parser')
+        text = ''
+        for part_of_text in page.find('div', class_='text').find_all('span'):
             text += part_of_text.get_text()
         return text
